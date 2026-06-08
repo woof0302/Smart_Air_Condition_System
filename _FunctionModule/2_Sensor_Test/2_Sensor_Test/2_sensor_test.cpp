@@ -1,99 +1,117 @@
+#include <pigpio.h>
 #include <iostream>
 #include <thread>
 #include <chrono>
-#include <gpiod.h>
 
-#include "SimpleDHT.h"
+constexpr int DHT_PIN = 26;
+constexpr int ES92B4_PIN = 21;
 
-#define PHOTO_GPIO 21
-#define DHT_GPIO   26
+struct DHT11Data
+{
+    float temperature;
+    float humidity;
+};
+
+bool readDHT11(DHT11Data& data)
+{
+    uint8_t bits[5] = { 0 };
+
+    gpioSetMode(DHT_PIN, PI_OUTPUT);
+    gpioWrite(DHT_PIN, PI_LOW);
+    gpioDelay(18000);
+
+    gpioWrite(DHT_PIN, PI_HIGH);
+    gpioDelay(40);
+
+    gpioSetMode(DHT_PIN, PI_INPUT);
+
+    uint32_t timeout = gpioTick();
+
+    while (gpioRead(DHT_PIN) == PI_HIGH)
+        if (gpioTick() - timeout > 100) return false;
+
+    timeout = gpioTick();
+    while (gpioRead(DHT_PIN) == PI_LOW)
+        if (gpioTick() - timeout > 100) return false;
+
+    timeout = gpioTick();
+    while (gpioRead(DHT_PIN) == PI_HIGH)
+        if (gpioTick() - timeout > 100) return false;
+
+    for (int i = 0; i < 40; i++)
+    {
+        timeout = gpioTick();
+        while (gpioRead(DHT_PIN) == PI_LOW)
+            if (gpioTick() - timeout > 100) return false;
+
+        uint32_t start = gpioTick();
+
+        timeout = gpioTick();
+        while (gpioRead(DHT_PIN) == PI_HIGH)
+        {
+            if (gpioTick() - timeout > 120)
+                break;
+        }
+
+        uint32_t pulseLength = gpioTick() - start;
+
+        bits[i / 8] <<= 1;
+        if (pulseLength > 50)
+            bits[i / 8] |= 1;
+    }
+
+    uint8_t checksum =
+        (bits[0] + bits[1] + bits[2] + bits[3]) & 0xFF;
+
+    if (checksum != bits[4])
+        return false;
+
+    data.humidity = bits[0];
+    data.temperature = bits[2];
+
+    return true;
+}
 
 int main()
 {
-    SimpleDHT11 dht11(DHT_GPIO);
-
-    gpiod_chip* chip = gpiod_chip_open("/dev/gpiochip0");
-
-    if (!chip)
+    if (gpioInitialise() < 0)
     {
-        std::cerr << "gpiochip open failed\n";
+        std::cerr << "pigpio init failed\n";
         return 1;
     }
 
-    gpiod_line* photoLine =
-        gpiod_chip_get_line(chip, PHOTO_GPIO);
-
-    if (!photoLine)
-    {
-        std::cerr << "GPIO21 open failed\n";
-        return 1;
-    }
-
-    gpiod_line_request_input(photoLine, "photo_sensor");
-
-    int previousPhoto =
-        gpiod_line_get_value(photoLine);
+    gpioSetMode(ES92B4_PIN, PI_INPUT);
+    gpioSetPullUpDown(ES92B4_PIN, PI_PUD_UP);
 
     while (true)
     {
-        // DHT11 Temp,Hum Sensor
+        DHT11Data dht;
 
-        byte temperature = 0;
-        byte humidity = 0;
+        bool ok = readDHT11(dht);
 
-        int err =
-            dht11.read(&temperature,
-                &humidity,
-                nullptr);
+        double esValue =
+            gpioRead(ES92B4_PIN) ? 1.0 : 0.0;
 
-        std::cout << "\n========================\n";
-
-        if (err == SimpleDHTErrSuccess)
+        if (ok)
         {
             std::cout
-                << "Temperature : "
-                << static_cast<int>(temperature)
-                << " °C\n";
-
-            std::cout
-                << "Humidity : "
-                << static_cast<int>(humidity)
-                << " %\n";
+                << "Temp: " << dht.temperature << " C, "
+                << "Humidity: " << dht.humidity << " %, "
+                << "ES92B4: " << esValue
+                << std::endl;
         }
         else
         {
             std::cout
-                << "DHT11 읽기 실패 ("
-                << err
-                << ")\n";
-        }
-       
-        // ES92B4   Photon Sensor
-        int photoValue =
-            gpiod_line_get_value(photoLine);
-
-        std::cout
-            << "Photon : "
-            << photoValue
-            << '\n';
-
-        if (photoValue != previousPhoto)
-        {
-            if (photoValue == 1)
-            {
-                std::cout
-                    << ">>> Passed!\n";
-            }
-
-            previousPhoto = photoValue;
+                << "DHT11 read failed, "
+                << "ES92B4: " << esValue
+                << std::endl;
         }
 
         std::this_thread::sleep_for(
             std::chrono::seconds(2));
     }
 
-    gpiod_line_release(photoLine);
-    gpiod_chip_close(chip);
-
+    gpioTerminate();
     return 0;
 }
